@@ -1,0 +1,433 @@
+using Microsoft.AspNetCore.SignalR;
+using Microsoft.Extensions.Options;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+
+namespace Aura.Orchestrator
+{
+    /// <summary>
+    /// SignalR Hub für Drone-Kommunikation gemäß §2 der Spezifikation
+    /// </summary>
+    public class DroneHub : Hub
+    {
+        private readonly IDroneRegistry _droneRegistry;
+        private readonly ICommandDispatcher _commandDispatcher;
+        private readonly ISessionRegistry _sessionRegistry;
+        private readonly ISharedContextStore _sharedContext;
+        private readonly ILogger<DroneHub> _logger;
+        private readonly OrchestratorConfig _config;
+
+        // Zeitkonstanten gemäß §1.3
+        private readonly TimeSpan AckTimeout;
+        private readonly TimeSpan HeartbeatExpect;
+        private readonly TimeSpan DisconnectGrace;
+
+        public DroneHub(
+            IDroneRegistry droneRegistry,
+            ICommandDispatcher commandDispatcher,
+            ISessionRegistry sessionRegistry,
+            ISharedContextStore sharedContext,
+            IOptions<OrchestratorConfig> config,
+            ILogger<DroneHub> logger)
+        {
+            _droneRegistry = droneRegistry;
+            _commandDispatcher = commandDispatcher;
+            _sessionRegistry = sessionRegistry;
+            _sharedContext = sharedContext;
+            _config = config.Value;
+            _logger = logger;
+
+            AckTimeout = TimeSpan.FromSeconds(_config.Scheduling.AckTimeoutSec);
+            HeartbeatExpect = TimeSpan.FromSeconds(_config.Scheduling.HeartbeatExpectSec);
+            DisconnectGrace = TimeSpan.FromSeconds(_config.Scheduling.DisconnectGraceSec);
+        }
+
+        #region Connection Management
+
+        public override async Task OnConnectedAsync()
+        {
+            _logger.LogInformation($"Drone connection attempt from {Context.ConnectionId}");
+            
+            // Authentifizierung prüfen
+            var apiKey = Context.GetHttpContext()?.Request.Headers["X-API-Key"].FirstOrDefault();
+            if (string.IsNullOrEmpty(apiKey) || apiKey != _config.Server.ApiKey)
+            {
+                _logger.LogWarning($"Unauthorized connection attempt from {Context.ConnectionId}");
+                Context.Abort();
+                return;
+            }
+
+            await base.OnConnectedAsync();
+        }
+
+        public override async Task OnDisconnectedAsync(Exception exception)
+        {
+            var droneId = _droneRegistry.GetDroneIdByConnection(Context.ConnectionId);
+            if (!string.IsNullOrEmpty(droneId))
+            {
+                _logger.LogInformation($"Drone {droneId} disconnected: {exception?.Message ?? "normal"}");
+                await _droneRegistry.UnregisterDrone(droneId);
+                await _commandDispatcher.HandleDroneDisconnected(droneId);
+            }
+
+            await base.OnDisconnectedAsync(exception);
+        }
+
+        #endregion
+
+        #region Drone → Server Methods (§2.1)
+
+        /// <summary>
+        /// Drone registriert sich beim Orchestrator
+        /// </summary>
+        public async Task RegisterDrone(DroneRegistrationPayload payload)
+        {
+            try
+            {
+                _logger.LogInformation($"Registering drone: {payload.DroneId}");
+
+                // Validierung der Pflichtfelder gemäß §2.3
+                if (string.IsNullOrEmpty(payload.DroneId) ||
+                    string.IsNullOrEmpty(payload.Version) ||
+                    payload.StaticCapabilities == null ||
+                    payload.Modules == null)
+                {
+                    throw new ArgumentException("Missing required registration fields");
+                }
+
+                var drone = new DroneInfo
+                {
+                    DroneId = payload.DroneId,
+                    ConnectionId = Context.ConnectionId,
+                    Version = payload.Version,
+                    StaticCapabilities = payload.StaticCapabilities,
+                    Modules = payload.Modules,
+                    LimitsSupported = payload.LimitsSupported,
+                    RegisteredAt = DateTime.UtcNow,
+                    LastHeartbeat = DateTime.UtcNow,
+                    Status = DroneStatus.Idle
+                };
+
+                await _droneRegistry.RegisterDrone(drone);
+                
+                // Drone zur entsprechenden Gruppe hinzufügen
+                await Groups.AddToGroupAsync(Context.ConnectionId, "drones");
+                await Groups.AddToGroupAsync(Context.ConnectionId, $"drone_{payload.DroneId}");
+
+                _logger.LogInformation($"Drone {payload.DroneId} successfully registered");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Failed to register drone");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Drone bestätigt Empfang eines Commands (unverzüglich gemäß §2.3)
+        /// </summary>
+        public async Task AcknowledgeCommand(string commandId)
+        {
+            try
+            {
+                var droneId = _droneRegistry.GetDroneIdByConnection(Context.ConnectionId);
+                _logger.LogDebug($"Drone {droneId} acknowledged command {commandId}");
+                
+                await _commandDispatcher.HandleAcknowledgment(commandId, droneId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Failed to process acknowledgment for command {commandId}");
+            }
+        }
+
+        /// <summary>
+        /// Drone meldet erfolgreiches Ergebnis
+        /// </summary>
+        public async Task ReportResult(CommandResultPayload payload)
+        {
+            try
+            {
+                var droneId = _droneRegistry.GetDroneIdByConnection(Context.ConnectionId);
+                _logger.LogInformation($"Drone {droneId} reported result for command {payload.CommandId}");
+
+                // Ergebnis verarbeiten und in Shared Context speichern
+                await ProcessResultArtifacts(payload);
+                
+                // Command als abgeschlossen markieren
+                await _commandDispatcher.HandleResult(payload.CommandId, droneId, payload);
+                
+                // Pacing-Token freigeben (§2.4)
+                await _droneRegistry.ReleasePacingToken(droneId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Failed to process result for command {payload.CommandId}");
+            }
+        }
+
+        /// <summary>
+        /// Drone meldet Fehler
+        /// </summary>
+        public async Task ReportError(CommandErrorPayload payload)
+        {
+            try
+            {
+                var droneId = _droneRegistry.GetDroneIdByConnection(Context.ConnectionId);
+                _logger.LogWarning($"Drone {droneId} reported error for command {payload.CommandId}: {payload.Error}");
+
+                await _commandDispatcher.HandleError(payload.CommandId, droneId, payload);
+                
+                // Pacing-Token freigeben
+                await _droneRegistry.ReleasePacingToken(droneId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Failed to process error for command {payload.CommandId}");
+            }
+        }
+
+        /// <summary>
+        /// Drone meldet Status-Update (zyklisch)
+        /// </summary>
+        public async Task ReportStatus(StatusPayload payload)
+        {
+            try
+            {
+                var droneId = _droneRegistry.GetDroneIdByConnection(Context.ConnectionId);
+                await _droneRegistry.UpdateDroneStatus(droneId, payload);
+                
+                // Heartbeat aktualisieren
+                await _droneRegistry.UpdateHeartbeat(droneId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to process status update");
+            }
+        }
+
+        /// <summary>
+        /// Drone fordert menschliche Intervention an (Breakpoint)
+        /// </summary>
+        public async Task RequireIntervention(InterventionPayload payload)
+        {
+            try
+            {
+                var droneId = _droneRegistry.GetDroneIdByConnection(Context.ConnectionId);
+                _logger.LogInformation($"Drone {droneId} requires intervention: {payload.Type} for command {payload.CommandId}");
+
+                await _commandDispatcher.HandleInterventionRequest(payload.CommandId, droneId, payload);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to process intervention request");
+            }
+        }
+
+        /// <summary>
+        /// Drone antwortet auf Query
+        /// </summary>
+        public async Task QueryResponse(QueryResponsePayload payload)
+        {
+            try
+            {
+                var droneId = _droneRegistry.GetDroneIdByConnection(Context.ConnectionId);
+                _logger.LogDebug($"Drone {droneId} responded to query {payload.QueryId}");
+
+                await _commandDispatcher.HandleQueryResponse(payload.QueryId, droneId, payload);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Failed to process query response for {payload.QueryId}");
+            }
+        }
+
+        #endregion
+
+        #region Helper Methods
+
+        private async Task ProcessResultArtifacts(CommandResultPayload payload)
+        {
+            // Artifacts in Shared Context speichern (§7)
+            if (payload.Artifacts != null)
+            {
+                foreach (var artifact in payload.Artifacts)
+                {
+                    switch (artifact.Type)
+                    {
+                        case "facts":
+                            await _sharedContext.StoreFacts(artifact.Data as JArray);
+                            break;
+                        case "snippets":
+                            await _sharedContext.StoreSnippets(artifact.Data as JArray);
+                            break;
+                        case "screenshot":
+                        case "pptx":
+                        case "text":
+                            await _sharedContext.StoreArtifact(artifact);
+                            break;
+                    }
+                }
+            }
+
+            // Session-State aktualisieren wenn vorhanden
+            if (!string.IsNullOrEmpty(payload.SessionLeaseId))
+            {
+                await _sessionRegistry.UpdateSessionState(payload.SessionLeaseId, payload.SessionState);
+            }
+        }
+
+        #endregion
+    }
+
+    #region Data Transfer Objects
+
+    public class DroneRegistrationPayload
+    {
+        [JsonProperty("droneId")]
+        public string DroneId { get; set; }
+
+        [JsonProperty("version")]
+        public string Version { get; set; }
+
+        [JsonProperty("static_capabilities")]
+        public List<string> StaticCapabilities { get; set; }
+
+        [JsonProperty("modules")]
+        public List<string> Modules { get; set; }
+
+        [JsonProperty("limits_supported")]
+        public LimitsSupport LimitsSupported { get; set; }
+    }
+
+    public class LimitsSupport
+    {
+        [JsonProperty("domain_guard")]
+        public bool DomainGuard { get; set; }
+
+        [JsonProperty("qps_gate")]
+        public bool QpsGate { get; set; }
+    }
+
+    public class CommandResultPayload
+    {
+        [JsonProperty("commandId")]
+        public string CommandId { get; set; }
+
+        [JsonProperty("result")]
+        public JObject Result { get; set; }
+
+        [JsonProperty("artifacts")]
+        public List<ArtifactData> Artifacts { get; set; }
+
+        [JsonProperty("sessionLeaseId")]
+        public string SessionLeaseId { get; set; }
+
+        [JsonProperty("sessionState")]
+        public JObject SessionState { get; set; }
+    }
+
+    public class CommandErrorPayload
+    {
+        [JsonProperty("commandId")]
+        public string CommandId { get; set; }
+
+        [JsonProperty("error")]
+        public string Error { get; set; }
+
+        [JsonProperty("errorType")]
+        public string ErrorType { get; set; }
+
+        [JsonProperty("canRetry")]
+        public bool CanRetry { get; set; }
+    }
+
+    public class StatusPayload
+    {
+        [JsonProperty("status")]
+        public string Status { get; set; }
+
+        [JsonProperty("currentCommand")]
+        public string CurrentCommand { get; set; }
+
+        [JsonProperty("progress")]
+        public int Progress { get; set; }
+
+        [JsonProperty("memoryUsage")]
+        public long MemoryUsage { get; set; }
+
+        [JsonProperty("cpuUsage")]
+        public double CpuUsage { get; set; }
+    }
+
+    public class InterventionPayload
+    {
+        [JsonProperty("commandId")]
+        public string CommandId { get; set; }
+
+        [JsonProperty("type")]
+        public string Type { get; set; } // captcha, review, milestone
+
+        [JsonProperty("data")]
+        public JObject Data { get; set; }
+
+        [JsonProperty("resumeToken")]
+        public string ResumeToken { get; set; }
+    }
+
+    public class QueryResponsePayload
+    {
+        [JsonProperty("queryId")]
+        public string QueryId { get; set; }
+
+        [JsonProperty("response")]
+        public JObject Response { get; set; }
+    }
+
+    public class ArtifactData
+    {
+        [JsonProperty("type")]
+        public string Type { get; set; }
+
+        [JsonProperty("data")]
+        public object Data { get; set; }
+
+        [JsonProperty("metadata")]
+        public JObject Metadata { get; set; }
+    }
+
+    #endregion
+
+    #region Server → Drone Communication
+
+    public static class DroneHubExtensions
+    {
+        /// <summary>
+        /// Sendet Command an spezifische Drone
+        /// </summary>
+        public static async Task SendCommandToDrone(this IHubContext<DroneHub> hubContext, 
+            string droneId, CommandPayload command)
+        {
+            await hubContext.Clients.Group($"drone_{droneId}")
+                .SendAsync("ExecuteCommand", JsonConvert.SerializeObject(command));
+        }
+
+        /// <summary>
+        /// Sendet Query an spezifische Drone
+        /// </summary>
+        public static async Task SendQueryToDrone(this IHubContext<DroneHub> hubContext, 
+            string droneId, QueryPayload query)
+        {
+            await hubContext.Clients.Group($"drone_{droneId}")
+                .SendAsync("ExecuteQuery", JsonConvert.SerializeObject(query));
+        }
+    }
+
+    #endregion
+}

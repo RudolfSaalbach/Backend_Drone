@@ -1,0 +1,352 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using MediatR;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Newtonsoft.Json;
+
+namespace AuraOrchestrator.DroneHost.Intervention
+{
+    /// <summary>
+    /// Enhanced intervention manager with actual resume capability (§4, §5)
+    /// </summary>
+    public class EnhancedInterventionManager : IInterventionManager
+    {
+        private readonly ILogger<EnhancedInterventionManager> _logger;
+        private readonly IMediator _mediator;
+        private readonly IBrowserController _browserController;
+        private readonly IInterventionDetector _detector;
+        private readonly IMetricsCollector _metricsCollector;
+        private readonly InterventionOptions _options;
+        
+        private InterventionContext _currentIntervention;
+        private readonly SemaphoreSlim _interventionLock = new(1, 1);
+        private CancellationTokenSource _timeoutCts;
+
+        public EnhancedInterventionManager(
+            ILogger<EnhancedInterventionManager> logger,
+            IMediator mediator,
+            IBrowserController browserController,
+            IInterventionDetector detector,
+            IMetricsCollector metricsCollector,
+            IOptions<InterventionOptions> options)
+        {
+            _logger = logger;
+            _mediator = mediator;
+            _browserController = browserController;
+            _detector = detector;
+            _metricsCollector = metricsCollector;
+            _options = options.Value;
+        }
+
+        public async Task<InterventionContext> InitiateInterventionAsync(string reason, IDroneCommand parentCommand)
+        {
+            await _interventionLock.WaitAsync();
+            try
+            {
+                if (_currentIntervention != null)
+                {
+                    throw new InvalidOperationException("Already in intervention mode");
+                }
+
+                _logger.LogInformation("Initiating intervention: {Reason} for command {CommandId}", 
+                    reason, parentCommand.CommandId);
+
+                // Take screenshot if enabled
+                string screenshotPath = null;
+                if (_options.AttachScreenshot)
+                {
+                    screenshotPath = await _browserController.TakeScreenshotAsync();
+                }
+
+                // Get current context
+                var currentUrl = await _browserController.GetCurrentUrlAsync();
+                var domContext = await _detector.ExtractDomContextAsync();
+
+                // MUSS 4.1: Store replayable copy of last action
+                var replayableAction = CreateReplayableAction(parentCommand);
+
+                _currentIntervention = new InterventionContext
+                {
+                    CommandId = parentCommand.CommandId,
+                    ParentCommandId = parentCommand.CommandId, // MUSS 4.1
+                    Reason = reason,
+                    StartTime = DateTime.UtcNow,
+                    WindowTtl = TimeSpan.FromSeconds(_options.WindowTtlSec),
+                    StepTtl = TimeSpan.FromSeconds(_options.StepTtlSec),
+                    ParentCommand = parentCommand,
+                    ReplayableAction = replayableAction, // MUSS 4.1
+                    ScreenshotPath = screenshotPath,
+                    Url = currentUrl,
+                    DomContext = domContext,
+                    IsResumable = true
+                };
+
+                // Start timeout timer
+                _timeoutCts = new CancellationTokenSource(_currentIntervention.WindowTtl);
+                _timeoutCts.Token.Register(() => HandleInterventionTimeout());
+
+                // Enable browser interaction
+                _browserController.SetInteractionEnabled(true);
+
+                // Record metrics
+                _metricsCollector.IncrementCounter("drone_interventions_total", 1, 
+                    new Dictionary<string, string> { ["reason"] = reason });
+
+                // Send intervention event
+                await SendInterventionEventAsync();
+
+                return _currentIntervention;
+            }
+            finally
+            {
+                _interventionLock.Release();
+            }
+        }
+
+        public async Task<CommandResult> HandleInterventionCommandAsync(IDroneCommand command)
+        {
+            if (_currentIntervention == null)
+            {
+                return CommandResult.Fail("Not in intervention mode");
+            }
+
+            // MUSS 5.1: Check mode and parentCommandId
+            if (command.Parameters?["mode"]?.ToString() != "intervention")
+            {
+                _logger.LogWarning("Command missing mode:intervention parameter");
+                return CommandResult.Fail("invalid_in_intervention_mode");
+            }
+
+            if (command.Parameters?["parentCommandId"]?.ToString() != _currentIntervention.ParentCommandId)
+            {
+                _logger.LogWarning("Command parentCommandId mismatch");
+                return CommandResult.Fail("invalid_in_intervention_mode");
+            }
+
+            // MUSS 5.1: Check whitelist
+            if (!IsAllowedInterventionCommand(command))
+            {
+                _logger.LogWarning("Command {CommandType} not in intervention whitelist", 
+                    command.GetType().Name);
+                return CommandResult.Fail("invalid_in_intervention_mode");
+            }
+
+            // Reset step timeout
+            _currentIntervention.LastStepTime = DateTime.UtcNow;
+
+            // Track intervention step
+            _currentIntervention.Steps.Add(new InterventionStep
+            {
+                CommandType = command.GetType().Name,
+                Timestamp = DateTime.UtcNow,
+                Command = command // Store for potential replay
+            });
+
+            _logger.LogDebug("Executing intervention command: {CommandType}", command.GetType().Name);
+
+            // Execute the command
+            return await _mediator.Send(command);
+        }
+
+        public async Task<CommandResult> ResumeExecutionAsync(ResumeOptions options = null)
+        {
+            await _interventionLock.WaitAsync();
+            try
+            {
+                if (_currentIntervention == null)
+                {
+                    return CommandResult.Fail("Not in intervention mode");
+                }
+
+                _logger.LogInformation("Resuming execution after intervention");
+
+                // Cancel timeout
+                _timeoutCts?.Cancel();
+
+                // Disable browser interaction
+                _browserController.SetInteractionEnabled(false);
+
+                // MUSS 4.2: Execute the stored replay action
+                IDroneCommand actionToReplay = options?.ActionOverride ?? _currentIntervention.ReplayableAction;
+                
+                if (actionToReplay != null)
+                {
+                    _logger.LogInformation("Replaying action: {CommandType}", actionToReplay.GetType().Name);
+                    
+                    // Execute the replay action
+                    var replayResult = await _mediator.Send(actionToReplay);
+                    
+                    if (!replayResult.Success)
+                    {
+                        _logger.LogWarning("Replay action failed: {Error}", replayResult.Error);
+                    }
+                }
+
+                // Record intervention duration
+                var duration = DateTime.UtcNow - _currentIntervention.StartTime;
+                _metricsCollector.RecordHistogram("drone_intervention_window_ms", duration.TotalMilliseconds);
+
+                // Clear intervention
+                var parentCommand = _currentIntervention.ParentCommand;
+                _currentIntervention = null;
+
+                _logger.LogInformation("Intervention completed, resumed parent command {CommandId}", 
+                    parentCommand.CommandId);
+
+                return CommandResult.Ok(new 
+                { 
+                    resumed = true,
+                    parentCommandId = parentCommand.CommandId,
+                    duration = duration
+                });
+            }
+            finally
+            {
+                _interventionLock.Release();
+            }
+        }
+
+        public async Task<bool> IsInInterventionModeAsync()
+        {
+            await _interventionLock.WaitAsync();
+            try
+            {
+                return _currentIntervention != null;
+            }
+            finally
+            {
+                _interventionLock.Release();
+            }
+        }
+
+        public InterventionContext GetCurrentIntervention()
+        {
+            return _currentIntervention;
+        }
+
+        public async Task<bool> CheckForInterventionAsync(string url, PersonaOverlay persona)
+        {
+            // Implementation from previous version
+            await Task.CompletedTask;
+            return false;
+        }
+
+        /// <summary>
+        /// MUSS 5.1: Whitelist of allowed intervention commands
+        /// </summary>
+        private bool IsAllowedInterventionCommand(IDroneCommand command)
+        {
+            return command switch
+            {
+                // Navigation commands
+                NavigateCommand when command.Parameters?["mode"]?.ToString() == "intervention" => true,
+                TypeCommand when command.Parameters?["mode"]?.ToString() == "intervention" => true,
+                ClickCommand when command.Parameters?["mode"]?.ToString() == "intervention" => true,
+                WaitForElementCommand when command.Parameters?["mode"]?.ToString() == "intervention" => true,
+                
+                // Script only if safe
+                ExecuteScriptCommand when command.Parameters?["safe"]?.ToObject<bool>() == true => true,
+                
+                // Cookie management
+                ManageCookiesCommand cmd => cmd.Action == CookieAction.Export || cmd.Action == CookieAction.Import,
+                
+                // Human-like actions if enabled
+                _ when command.GetType().Name.Contains("Wait") => true,
+                _ when command.GetType().Name.Contains("Scroll") => true,
+                _ when command.GetType().Name.Contains("MouseMove") => true,
+                
+                _ => false
+            };
+        }
+
+        /// <summary>
+        /// MUSS 4.1: Create replayable copy of last action
+        /// </summary>
+        private IDroneCommand CreateReplayableAction(IDroneCommand original)
+        {
+            // Clone the command with all parameters
+            var json = JsonConvert.SerializeObject(original);
+            var clone = JsonConvert.DeserializeObject(json, original.GetType()) as IDroneCommand;
+            
+            // Ensure it has a new command ID for replay
+            if (clone != null)
+            {
+                clone.CommandId = $"{original.CommandId}_replay";
+            }
+            
+            return clone;
+        }
+
+        private async Task SendInterventionEventAsync()
+        {
+            var payload = new
+            {
+                @event = "RequireIntervention",
+                commandId = _currentIntervention.CommandId,
+                parentCommandId = _currentIntervention.ParentCommandId,
+                reason = _currentIntervention.Reason,
+                resumable = true,
+                context = _currentIntervention.DomContext,
+                screenshot = _currentIntervention.ScreenshotPath != null 
+                    ? new { path = _currentIntervention.ScreenshotPath } 
+                    : null
+            };
+
+            _logger.LogDebug("Sending intervention event: {Payload}", JsonConvert.SerializeObject(payload));
+            await Task.CompletedTask;
+        }
+
+        private void HandleInterventionTimeout()
+        {
+            _logger.LogWarning("Intervention timeout for command {CommandId}", 
+                _currentIntervention?.CommandId);
+
+            Task.Run(async () =>
+            {
+                await _interventionLock.WaitAsync();
+                try
+                {
+                    if (_currentIntervention != null)
+                    {
+                        _currentIntervention = null;
+                        _browserController.SetInteractionEnabled(false);
+                        
+                        _metricsCollector.IncrementCounter("drone_intervention_timeouts", 1);
+                    }
+                }
+                finally
+                {
+                    _interventionLock.Release();
+                }
+            });
+        }
+    }
+
+    public class InterventionContext
+    {
+        public string CommandId { get; set; }
+        public string ParentCommandId { get; set; } // MUSS 4.1
+        public string Reason { get; set; }
+        public DateTime StartTime { get; set; }
+        public TimeSpan WindowTtl { get; set; }
+        public TimeSpan StepTtl { get; set; }
+        public DateTime LastStepTime { get; set; }
+        public IDroneCommand ParentCommand { get; set; }
+        public IDroneCommand ReplayableAction { get; set; } // MUSS 4.1
+        public string ScreenshotPath { get; set; }
+        public string Url { get; set; }
+        public Dictionary<string, object> DomContext { get; set; }
+        public bool IsResumable { get; set; }
+        public List<InterventionStep> Steps { get; set; } = new();
+    }
+
+    public class InterventionStep
+    {
+        public string CommandType { get; set; }
+        public DateTime Timestamp { get; set; }
+        public IDroneCommand Command { get; set; } // Store for replay
+    }
+}

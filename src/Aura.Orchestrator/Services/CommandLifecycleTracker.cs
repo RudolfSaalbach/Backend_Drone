@@ -113,6 +113,17 @@ public sealed class CommandLifecycleTracker : ICommandLifecycleTracker
         }
     }
 
+    public void RecordFailure(string commandId, string reason)
+    {
+        if (_states.TryRemove(commandId, out var state))
+        {
+            state.MarkFailed(reason);
+            state.ReleaseResources();
+        }
+
+        _completionResults[commandId] = new CommandAcknowledgementResult(CommandAcknowledgementStatus.Failed, reason);
+    }
+
     private sealed class CommandState
     {
         private readonly TaskCompletionSource<CommandAcknowledgementResult> _acknowledged = new(TaskCreationOptions.RunContinuationsAsynchronously);

@@ -39,6 +39,11 @@ public sealed class SchedulingConfig
     /// Sleep interval between per drone queue scans.
     /// </summary>
     public int DispatchLoopDelayMs { get; set; } = 100;
+
+    /// <summary>
+    /// Maximum number of persona lookup retries before abandoning a task.
+    /// </summary>
+    public int MaxPersonaLookupRetries { get; set; } = 3;
 }
 
 public sealed class ReadyQueueConfig

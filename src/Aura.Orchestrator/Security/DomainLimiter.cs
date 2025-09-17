@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
+using System.Threading.Tasks;
 using Aura.Orchestrator.Configuration;
 using Aura.Orchestrator.Metrics;
 using Microsoft.Extensions.Logging;
@@ -25,6 +26,11 @@ public sealed class DomainLimiter : IDomainLimiter
 
     public Task<DomainLease?> TryAcquireAsync(string droneId, string? domain, CancellationToken cancellationToken)
     {
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return Task.FromCanceled<DomainLease?>(cancellationToken);
+        }
+
         if (string.IsNullOrWhiteSpace(domain))
         {
             return Task.FromResult<DomainLease?>(null);
@@ -46,6 +52,8 @@ public sealed class DomainLimiter : IDomainLimiter
         {
             lock (droneState.SyncRoot)
             {
+                cancellationToken.ThrowIfCancellationRequested();
+
                 droneState.TrimOldRequests(now);
 
                 if (droneState.IsInCooldown(now))

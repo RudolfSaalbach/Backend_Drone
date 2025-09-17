@@ -16,6 +16,8 @@ public interface ICommandLifecycleTracker
     void Fail(string commandId, string droneId, string reason);
 
     void FailAll(string droneId, string reason);
+
+    void RecordFailure(string commandId, string reason);
 }
 
 public sealed record CommandDispatchRegistration(string CommandId, string DroneId);

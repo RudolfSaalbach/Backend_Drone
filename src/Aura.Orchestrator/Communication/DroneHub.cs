@@ -180,30 +180,58 @@ public sealed class DroneHub : Hub
         {
             foreach (var artifact in payload.Artifacts)
             {
-                switch (artifact.Type)
+                try
                 {
-                    case "facts":
-                        if (artifact.Data is JArray facts)
-                        {
-                            await _sharedContextStore.StoreFactsAsync(facts).ConfigureAwait(false);
-                        }
-                        break;
-                    case "snippets":
-                        if (artifact.Data is JArray snippets)
-                        {
-                            await _sharedContextStore.StoreSnippetsAsync(snippets).ConfigureAwait(false);
-                        }
-                        break;
-                    default:
-                        await _sharedContextStore.StoreArtifactAsync(artifact).ConfigureAwait(false);
-                        break;
+                    switch (artifact.Type)
+                    {
+                        case "facts":
+                            if (artifact.Data is JArray facts)
+                            {
+                                await _sharedContextStore.StoreFactsAsync(facts).ConfigureAwait(false);
+                            }
+                            break;
+                        case "snippets":
+                            if (artifact.Data is JArray snippets)
+                            {
+                                await _sharedContextStore.StoreSnippetsAsync(snippets).ConfigureAwait(false);
+                            }
+                            break;
+                        default:
+                            await _sharedContextStore.StoreArtifactAsync(artifact).ConfigureAwait(false);
+                            break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    var artifactType = string.IsNullOrWhiteSpace(artifact.Type) ? "unknown" : artifact.Type;
+                    _logger.LogError(
+                        ex,
+                        "Failed to persist artifact {ArtifactType} for command {CommandId}",
+                        artifactType,
+                        payload.CommandId);
+                    _metrics.IncrementCounter(
+                        "artifacts_persist_failed_total",
+                        1,
+                        new Dictionary<string, string> { ["type"] = artifactType });
                 }
             }
         }
 
         if (!string.IsNullOrEmpty(payload.SessionLeaseId) && payload.SessionState is JObject state)
         {
-            await _sessionRegistry.UpdateSessionStateAsync(payload.SessionLeaseId, state).ConfigureAwait(false);
+            try
+            {
+                await _sessionRegistry.UpdateSessionStateAsync(payload.SessionLeaseId, state).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Failed to persist session state for lease {LeaseId} from command {CommandId}",
+                    payload.SessionLeaseId,
+                    payload.CommandId);
+                _metrics.IncrementCounter("session_state_persist_failed_total");
+            }
         }
     }
 }

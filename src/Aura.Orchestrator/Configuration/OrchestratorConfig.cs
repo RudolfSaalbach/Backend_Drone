@@ -39,6 +39,22 @@ public sealed class SchedulingConfig
     /// Sleep interval between per drone queue scans.
     /// </summary>
     public int DispatchLoopDelayMs { get; set; } = 100;
+
+    /// <summary>
+    /// Maximum number of times a task will be retried when its persona cannot be loaded.
+    /// </summary>
+    public int PersonaMissingMaxRetries { get; set; } = 5;
+
+    /// <summary>
+    /// Base delay in seconds before retrying a task that failed to load a persona.
+    /// Exponential backoff is applied on top of this base value.
+    /// </summary>
+    public int PersonaMissingBaseDelaySec { get; set; } = 5;
+
+    /// <summary>
+    /// Upper bound in seconds for the persona retry backoff delay.
+    /// </summary>
+    public int PersonaMissingMaxBackoffSec { get; set; } = 120;
 }
 
 public sealed class ReadyQueueConfig
@@ -55,6 +71,11 @@ public sealed class LimitsConfig
 {
     public GlobalDomainLimits Global { get; set; } = new();
     public PerDomainLimits PerDomain { get; set; } = new();
+
+    /// <summary>
+    /// Seconds before idle domain limiter state is trimmed from memory.
+    /// </summary>
+    public int DomainStateTtlSeconds { get; set; } = 600;
 }
 
 public sealed class GlobalDomainLimits

@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Channels;
+using System.Threading.Tasks;
 using Aura.Orchestrator.Communication;
 using Aura.Orchestrator.Configuration;
 using Aura.Orchestrator.Metrics;
@@ -34,7 +36,10 @@ public sealed class OrchestratorTaskScheduler : BackgroundService
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _pacingTokens = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, int> _perDroneQueueLengths = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTime> _lastAssignment = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, Task> _perDroneProcessors = new(StringComparer.OrdinalIgnoreCase);
     private int _globalQueueLength;
+    private CancellationToken _schedulerStoppingToken;
+    private readonly CancellationTokenSource _processorCts = new();
 
     public OrchestratorTaskScheduler(
         ILogger<OrchestratorTaskScheduler> logger,
@@ -82,11 +87,20 @@ public sealed class OrchestratorTaskScheduler : BackgroundService
 
     protected override Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        _schedulerStoppingToken = stoppingToken;
+        stoppingToken.Register(() =>
+        {
+            _processorCts.Cancel();
+            foreach (var queue in _perDroneQueues.Values)
+            {
+                queue.Writer.TryComplete();
+            }
+        });
         _logger.LogInformation("Starting orchestrator task scheduler");
         var processors = new[]
         {
             ProcessGlobalQueueAsync(stoppingToken),
-            ProcessPerDroneQueuesAsync(stoppingToken),
+            MonitorPerDroneProcessorsAsync(stoppingToken),
             MonitorQueueMetricsAsync(stoppingToken)
         };
 
@@ -126,25 +140,76 @@ public sealed class OrchestratorTaskScheduler : BackgroundService
         }
     }
 
-    private async Task ProcessPerDroneQueuesAsync(CancellationToken cancellationToken)
+    private async Task MonitorPerDroneProcessorsAsync(CancellationToken cancellationToken)
     {
-        while (!cancellationToken.IsCancellationRequested)
+        try
         {
-            foreach (var (droneId, queue) in _perDroneQueues)
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                foreach (var (droneId, processor) in _perDroneProcessors)
+                {
+                    if (processor.IsFaulted)
+                    {
+                        _logger.LogError(processor.Exception, "Per-drone processor faulted for {DroneId}", droneId);
+                        _perDroneProcessors.TryRemove(droneId, out _);
+                    }
+                }
+
+                await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Scheduler is stopping, fall through to await outstanding processors.
+        }
+        finally
+        {
+            if (_perDroneProcessors.Count > 0)
+            {
+                try
+                {
+                    await Task.WhenAll(_perDroneProcessors.Values).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Per-drone processors completed with errors during shutdown");
+                }
+            }
+        }
+    }
+
+    private async Task ProcessPerDroneQueueAsync(string droneId, Channel<ScheduledTask> queue, CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (await queue.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 if (!await IsDroneAvailableAsync(droneId, cancellationToken).ConfigureAwait(false))
+                {
+                    await Task.Delay(_config.Scheduling.DispatchLoopDelayMs, cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
+
+                if (!queue.Reader.TryRead(out var task))
                 {
                     continue;
                 }
 
-                if (queue.Reader.TryRead(out var task))
-                {
-                    AdjustPerDroneQueueLength(droneId, -1);
-                    await DispatchAsync(droneId, task, cancellationToken).ConfigureAwait(false);
-                }
+                AdjustPerDroneQueueLength(droneId, -1);
+                await DispatchAsync(droneId, task, cancellationToken).ConfigureAwait(false);
             }
-
-            await Task.Delay(_config.Scheduling.DispatchLoopDelayMs, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Scheduler is stopping.
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to process queue for drone {DroneId}", droneId);
+        }
+        finally
+        {
+            _perDroneProcessors.TryRemove(droneId, out _);
         }
     }
 
@@ -223,13 +288,13 @@ public sealed class OrchestratorTaskScheduler : BackgroundService
 
     private async Task EnqueuePerDroneAsync(string droneId, ScheduledTask task, CancellationToken cancellationToken)
     {
-        var queue = _perDroneQueues.GetOrAdd(droneId, _ => CreatePerDroneQueue());
+        var queue = _perDroneQueues.GetOrAdd(droneId, id => CreatePerDroneQueue(id));
         await queue.Writer.WriteAsync(task, cancellationToken).ConfigureAwait(false);
         AdjustPerDroneQueueLength(droneId, +1);
         _metrics.IncrementCounter("tasks_queued_total", 1, new Dictionary<string, string> { ["drone_id"] = droneId });
     }
 
-    private Channel<ScheduledTask> CreatePerDroneQueue()
+    private Channel<ScheduledTask> CreatePerDroneQueue(string droneId)
     {
         var options = new BoundedChannelOptions(_config.Scheduling.PerDroneQueue.Capacity)
         {
@@ -238,7 +303,18 @@ public sealed class OrchestratorTaskScheduler : BackgroundService
             SingleWriter = false
         };
 
-        return Channel.CreateBounded<ScheduledTask>(options);
+        var channel = Channel.CreateBounded<ScheduledTask>(options);
+        StartPerDroneProcessor(droneId, channel);
+        return channel;
+    }
+
+    private void StartPerDroneProcessor(string droneId, Channel<ScheduledTask> queue)
+    {
+        var processor = Task.Run(() => ProcessPerDroneQueueAsync(droneId, queue, _processorCts.Token), CancellationToken.None);
+        if (!_perDroneProcessors.TryAdd(droneId, processor))
+        {
+            _logger.LogWarning("Attempted to register multiple processors for drone {DroneId}", droneId);
+        }
     }
 
     private async Task DispatchAsync(string droneId, ScheduledTask task, CancellationToken cancellationToken)
@@ -269,9 +345,9 @@ public sealed class OrchestratorTaskScheduler : BackgroundService
             var persona = await _personaLibrary.LoadPersonaAsync(task.PersonaId, cancellationToken).ConfigureAwait(false);
             if (persona == null)
             {
-                _logger.LogError("Persona {PersonaId} not found for task {CommandId}", task.PersonaId, task.CommandId);
                 pacingToken.Release();
                 domainLease?.Dispose();
+                await HandleMissingPersonaAsync(task, cancellationToken).ConfigureAwait(false);
                 return;
             }
 
@@ -378,7 +454,10 @@ public sealed class OrchestratorTaskScheduler : BackgroundService
         var drone = await _droneRegistry.GetDroneAsync(droneId, cancellationToken).ConfigureAwait(false);
         if (drone == null)
         {
-            _perDroneQueues.TryRemove(droneId, out _);
+            if (_perDroneQueues.TryRemove(droneId, out var removedQueue))
+            {
+                removedQueue.Writer.TryComplete();
+            }
             _pacingTokens.TryRemove(droneId, out _);
             _perDroneQueueLengths.TryRemove(droneId, out _);
             _lastAssignment.TryRemove(droneId, out _);
@@ -425,5 +504,105 @@ public sealed class OrchestratorTaskScheduler : BackgroundService
     private void AdjustPerDroneQueueLength(string droneId, int delta)
     {
         _perDroneQueueLengths.AddOrUpdate(droneId, delta, (_, current) => Math.Max(0, current + delta));
+    }
+
+    private Task HandleMissingPersonaAsync(ScheduledTask task, CancellationToken cancellationToken)
+    {
+        task.PersonaRetryCount++;
+        var attempts = task.PersonaRetryCount;
+        var personaIdLabel = string.IsNullOrWhiteSpace(task.PersonaId) ? "unknown" : task.PersonaId;
+
+        if (attempts > _config.Scheduling.PersonaMissingMaxRetries)
+        {
+            _logger.LogError(
+                "Persona {PersonaId} not found for command {CommandId} after {Attempts} attempts; giving up",
+                personaIdLabel,
+                task.CommandId,
+                attempts);
+            _metrics.IncrementCounter(
+                "tasks_persona_missing_failed_total",
+                1,
+                new Dictionary<string, string> { ["persona_id"] = personaIdLabel });
+            _commandLifecycle.Fail(task.CommandId, string.Empty, "missing_persona");
+            return Task.CompletedTask;
+        }
+
+        var delay = CalculatePersonaRetryDelay(attempts);
+        _logger.LogWarning(
+            "Persona {PersonaId} unavailable for command {CommandId}; retrying in {DelaySeconds:F1}s (attempt {Attempt})",
+            personaIdLabel,
+            task.CommandId,
+            delay.TotalSeconds,
+            attempts);
+
+        _metrics.IncrementCounter(
+            "tasks_persona_missing_retry_total",
+            1,
+            new Dictionary<string, string>
+            {
+                ["persona_id"] = personaIdLabel,
+                ["attempt"] = attempts.ToString(CultureInfo.InvariantCulture)
+            });
+
+        _ = ScheduleTaskRequeueAsync(task, delay, cancellationToken, personaIdLabel);
+        return Task.CompletedTask;
+    }
+
+    private TimeSpan CalculatePersonaRetryDelay(int attempt)
+    {
+        var baseDelay = Math.Max(1, _config.Scheduling.PersonaMissingBaseDelaySec);
+        var maxDelay = Math.Max(baseDelay, _config.Scheduling.PersonaMissingMaxBackoffSec);
+        var exponential = baseDelay * Math.Pow(2, attempt - 1);
+        var capped = Math.Min(exponential, maxDelay);
+        var jitterMultiplier = 0.75 + (Random.Shared.NextDouble() * 0.5);
+        var jittered = Math.Max(baseDelay, capped * jitterMultiplier);
+        return TimeSpan.FromSeconds(jittered);
+    }
+
+    private Task ScheduleTaskRequeueAsync(ScheduledTask task, TimeSpan delay, CancellationToken cancellationToken, string personaIdLabel)
+    {
+        return Task.Run(async () =>
+        {
+            try
+            {
+                if (delay > TimeSpan.Zero)
+                {
+                    await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                task.EnqueuedAt = DateTime.UtcNow;
+                await EnqueueTaskAsync(task, cancellationToken).ConfigureAwait(false);
+
+                _metrics.IncrementCounter("tasks_requeued_total");
+                _metrics.IncrementCounter(
+                    "tasks_persona_missing_requeued_total",
+                    1,
+                    new Dictionary<string, string>
+                    {
+                        ["persona_id"] = personaIdLabel,
+                        ["attempt"] = task.PersonaRetryCount.ToString(CultureInfo.InvariantCulture)
+                    });
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogDebug("Skipping persona retry requeue for command {CommandId} due to shutdown", task.CommandId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to requeue command {CommandId} after persona backoff", task.CommandId);
+            }
+        }, CancellationToken.None);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _processorCts.Cancel();
+            _processorCts.Dispose();
+        }
+
+        base.Dispose(disposing);
     }
 }

@@ -4,22 +4,36 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Aura.Orchestrator.Security;
 
 public sealed class PublicSuffixList
 {
+    private readonly ILogger<PublicSuffixList> _logger;
     private readonly HashSet<string> _rules;
     private readonly HashSet<string> _wildcardRules;
     private readonly HashSet<string> _exceptionRules;
 
     public PublicSuffixList()
-        : this(LoadEmbeddedRules())
+        : this(NullLogger<PublicSuffixList>.Instance)
+    {
+    }
+
+    public PublicSuffixList(ILogger<PublicSuffixList> logger)
+        : this(logger, LoadEmbeddedRules(logger))
     {
     }
 
     public PublicSuffixList(IEnumerable<string> rules)
+        : this(NullLogger<PublicSuffixList>.Instance, rules)
     {
+    }
+
+    public PublicSuffixList(ILogger<PublicSuffixList> logger, IEnumerable<string> rules)
+    {
+        _logger = logger ?? NullLogger<PublicSuffixList>.Instance;
         _rules = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         _wildcardRules = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         _exceptionRules = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -43,6 +57,15 @@ public sealed class PublicSuffixList
             else
             {
                 _rules.Add(rule);
+            }
+        }
+
+        if (_rules.Count == 0 && _wildcardRules.Count == 0 && _exceptionRules.Count == 0)
+        {
+            _logger.LogWarning("Public suffix list initialised with zero entries; applying default fallback rules.");
+            foreach (var fallback in DefaultRules())
+            {
+                _rules.Add(fallback);
             }
         }
     }
@@ -153,13 +176,14 @@ public sealed class PublicSuffixList
         return null;
     }
 
-    private static IEnumerable<string> LoadEmbeddedRules()
+    private static IEnumerable<string> LoadEmbeddedRules(ILogger<PublicSuffixList> logger)
     {
         var assembly = Assembly.GetExecutingAssembly();
         var resourceName = "Aura.Orchestrator.Security.public_suffix_list.dat";
         using var stream = assembly.GetManifestResourceStream(resourceName);
         if (stream == null)
         {
+            logger.LogError("Embedded public suffix list resource was not found; falling back to default rules.");
             return DefaultRules();
         }
 
@@ -172,6 +196,12 @@ public sealed class PublicSuffixList
             {
                 lines.Add(line);
             }
+        }
+
+        if (lines.Count < 100)
+        {
+            logger.LogWarning("Embedded public suffix list contained only {Count} entries; using default fallback.", lines.Count);
+            return DefaultRules();
         }
 
         return lines;

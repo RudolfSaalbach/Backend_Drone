@@ -103,6 +103,12 @@ public sealed class DroneHub : Hub
         _logger.LogInformation("Drone {DroneId} registered successfully", payload.DroneId);
     }
 
+    public Task RegisterOperator()
+    {
+        _logger.LogInformation("Operator connection {ConnectionId} registered", Context.ConnectionId);
+        return Groups.AddToGroupAsync(Context.ConnectionId, "operators");
+    }
+
     public async Task AcknowledgeCommand(string commandId)
     {
         var droneId = _droneRegistry.GetDroneIdByConnection(Context.ConnectionId);

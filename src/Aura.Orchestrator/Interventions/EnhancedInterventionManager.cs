@@ -21,6 +21,7 @@ public sealed class EnhancedInterventionManager : IInterventionManager
     private readonly IBrowserController _browserController;
     private readonly IInterventionDetector _detector;
     private readonly IMetricsCollector _metricsCollector;
+    private readonly IInterventionEventPublisher _eventPublisher;
     private readonly InterventionOptions _options;
 
     private readonly SemaphoreSlim _interventionLock = new(1, 1);
@@ -34,6 +35,7 @@ public sealed class EnhancedInterventionManager : IInterventionManager
         IBrowserController browserController,
         IInterventionDetector detector,
         IMetricsCollector metricsCollector,
+        IInterventionEventPublisher eventPublisher,
         IOptions<InterventionOptions> options)
     {
         _logger = logger;
@@ -41,6 +43,7 @@ public sealed class EnhancedInterventionManager : IInterventionManager
         _browserController = browserController;
         _detector = detector;
         _metricsCollector = metricsCollector;
+        _eventPublisher = eventPublisher;
         _options = options.Value;
     }
 
@@ -556,21 +559,25 @@ public sealed class EnhancedInterventionManager : IInterventionManager
             return;
         }
 
-        var payload = new
-        {
-            @event = "RequireIntervention",
-            commandId = _currentIntervention.CommandId,
-            parentCommandId = _currentIntervention.ParentCommandId,
-            reason = _currentIntervention.Reason,
-            resumable = true,
-            context = _currentIntervention.DomContext,
-            screenshot = _currentIntervention.ScreenshotPath != null
-                ? new { path = _currentIntervention.ScreenshotPath }
-                : null
-        };
+        var context = new Dictionary<string, object?>(_currentIntervention.DomContext);
+        var @event = new InterventionRequiredEvent(
+            _currentIntervention.CommandId,
+            _currentIntervention.ParentCommandId,
+            _currentIntervention.Reason,
+            _currentIntervention.IsResumable,
+            _currentIntervention.Url,
+            context,
+            _currentIntervention.ScreenshotPath);
 
-        _logger.LogDebug("Sending intervention event: {Payload}", JsonConvert.SerializeObject(payload));
-        await Task.CompletedTask;
+        try
+        {
+            await _eventPublisher.PublishAsync(@event, CancellationToken.None).ConfigureAwait(false);
+            _logger.LogInformation("Published intervention event for command {CommandId}", _currentIntervention.CommandId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to publish intervention event for command {CommandId}", _currentIntervention.CommandId);
+        }
     }
 
     private Task HandleInterventionTimeoutAsync()

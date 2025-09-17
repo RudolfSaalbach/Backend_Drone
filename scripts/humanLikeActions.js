@@ -55,15 +55,24 @@ export async function humanLikeType(selector, text, profile = {}) {
   let totalDelay = 0;
   let typedCount = 0;
   for (const char of text) {
-    if ('value' in element) {
-      element.value += char;
-    } else {
-      element.textContent = (element.textContent || '') + char;
+    const keyEventInit = { key: char, bubbles: true };
+    element.dispatchEvent(new KeyboardEvent('keydown', keyEventInit));
+
+    if (char.length === 1) {
+      element.dispatchEvent(new KeyboardEvent('keypress', keyEventInit));
     }
 
-    element.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true }));
-    element.dispatchEvent(new Event('input', { bubbles: true }));
-    element.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true }));
+    if ('value' in element) {
+      element.value = `${element.value}${char}`;
+    } else {
+      element.textContent = `${element.textContent || ''}${char}`;
+    }
+
+    const inputEvent = typeof InputEvent === 'function'
+      ? new InputEvent('input', { bubbles: true, data: char })
+      : new Event('input', { bubbles: true });
+    element.dispatchEvent(inputEvent);
+    element.dispatchEvent(new KeyboardEvent('keyup', keyEventInit));
 
     const rawDelay = randomDelay(options.charDelayMs, options.varianceMs);
     const delay = Math.max(0, Math.min(rawDelay, options.maxDelayMs));

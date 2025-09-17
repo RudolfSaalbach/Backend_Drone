@@ -61,7 +61,15 @@ public sealed class PublicSuffixList
         }
 
         var idn = new IdnMapping();
-        var asciiHost = idn.GetAscii(host);
+        string asciiHost;
+        try
+        {
+            asciiHost = idn.GetAscii(host);
+        }
+        catch (ArgumentException)
+        {
+            return host.ToLowerInvariant();
+        }
         var labels = asciiHost.Split('.', StringSplitOptions.RemoveEmptyEntries);
         if (labels.Length == 0)
         {

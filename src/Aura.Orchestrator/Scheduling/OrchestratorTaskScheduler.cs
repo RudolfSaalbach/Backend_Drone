@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Channels;
+using System.Threading.Tasks;
 using Aura.Orchestrator.Communication;
 using Aura.Orchestrator.Configuration;
 using Aura.Orchestrator.Metrics;
@@ -272,8 +273,37 @@ public sealed class OrchestratorTaskScheduler : BackgroundService
                 _logger.LogError("Persona {PersonaId} not found for task {CommandId}", task.PersonaId, task.CommandId);
                 pacingToken.Release();
                 domainLease?.Dispose();
+                domainLease = null;
+
+                task.PersonaLookupFailures += 1;
+                if (task.PersonaLookupFailures >= _config.Scheduling.MaxPersonaLookupRetries)
+                {
+                    _logger.LogError(
+                        "Abandoning command {CommandId} after {Failures} persona lookup failures",
+                        task.CommandId,
+                        task.PersonaLookupFailures);
+                    _commandLifecycle.RecordFailure(task.CommandId, "persona_not_found");
+                    _metrics.IncrementCounter(
+                        "persona_lookup_failures_total",
+                        1,
+                        new Dictionary<string, string> { ["reason"] = "persona_not_found" });
+                    return;
+                }
+
+                if (!cancellationToken.IsCancellationRequested)
+                {
+                    _metrics.IncrementCounter(
+                        "tasks_requeued_total",
+                        1,
+                        new Dictionary<string, string> { ["reason"] = "persona_not_found" });
+                    task.EnqueuedAt = DateTime.UtcNow;
+                    await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken).ConfigureAwait(false);
+                    await EnqueueTaskAsync(task, cancellationToken).ConfigureAwait(false);
+                }
                 return;
             }
+
+            task.PersonaLookupFailures = 0;
 
             var commandPayload = new CommandPayload
             {

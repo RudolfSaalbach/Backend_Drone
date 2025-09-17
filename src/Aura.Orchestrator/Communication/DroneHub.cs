@@ -18,8 +18,7 @@ public sealed class DroneHub : Hub
 {
     private readonly IDroneRegistry _droneRegistry;
     private readonly ICommandDispatcher _commandDispatcher;
-    private readonly ISessionRegistry _sessionRegistry;
-    private readonly ISharedContextStore _sharedContextStore;
+    private readonly IResultPersistenceQueue _resultPersistenceQueue;
     private readonly ILogger<DroneHub> _logger;
     private readonly IMetricsCollector _metrics;
     private readonly OrchestratorConfig _config;
@@ -27,16 +26,14 @@ public sealed class DroneHub : Hub
     public DroneHub(
         IDroneRegistry droneRegistry,
         ICommandDispatcher commandDispatcher,
-        ISessionRegistry sessionRegistry,
-        ISharedContextStore sharedContextStore,
+        IResultPersistenceQueue resultPersistenceQueue,
         IOptions<OrchestratorConfig> options,
         ILogger<DroneHub> logger,
         IMetricsCollector metrics)
     {
         _droneRegistry = droneRegistry;
         _commandDispatcher = commandDispatcher;
-        _sessionRegistry = sessionRegistry;
-        _sharedContextStore = sharedContextStore;
+        _resultPersistenceQueue = resultPersistenceQueue;
         _logger = logger;
         _metrics = metrics;
         _config = options.Value;
@@ -124,7 +121,7 @@ public sealed class DroneHub : Hub
             return;
         }
 
-        await PersistArtifactsAsync(payload).ConfigureAwait(false);
+        await QueueResultPersistenceAsync(payload).ConfigureAwait(false);
         await _commandDispatcher.HandleResultAsync(payload.CommandId, droneId, payload).ConfigureAwait(false);
     }
 
@@ -174,37 +171,31 @@ public sealed class DroneHub : Hub
         await _commandDispatcher.HandleQueryResponseAsync(payload.QueryId, droneId, payload).ConfigureAwait(false);
     }
 
-    private async Task PersistArtifactsAsync(CommandResultPayload payload)
+    private async Task QueueResultPersistenceAsync(CommandResultPayload payload)
     {
+        var artifacts = new List<ArtifactData>();
         if (payload.Artifacts != null)
         {
             foreach (var artifact in payload.Artifacts)
             {
-                switch (artifact.Type)
+                if (artifact == null)
                 {
-                    case "facts":
-                        if (artifact.Data is JArray facts)
-                        {
-                            await _sharedContextStore.StoreFactsAsync(facts).ConfigureAwait(false);
-                        }
-                        break;
-                    case "snippets":
-                        if (artifact.Data is JArray snippets)
-                        {
-                            await _sharedContextStore.StoreSnippetsAsync(snippets).ConfigureAwait(false);
-                        }
-                        break;
-                    default:
-                        await _sharedContextStore.StoreArtifactAsync(artifact).ConfigureAwait(false);
-                        break;
+                    continue;
                 }
+
+                artifacts.Add(new ArtifactData
+                {
+                    Type = artifact.Type,
+                    Data = artifact.Data?.DeepClone(),
+                    Metadata = artifact.Metadata?.DeepClone() as JObject ?? new JObject()
+                });
             }
         }
 
-        if (!string.IsNullOrEmpty(payload.SessionLeaseId) && payload.SessionState is JObject state)
-        {
-            await _sessionRegistry.UpdateSessionStateAsync(payload.SessionLeaseId, state).ConfigureAwait(false);
-        }
+        var sessionState = payload.SessionState?.DeepClone() as JObject;
+        var leaseId = string.IsNullOrWhiteSpace(payload.SessionLeaseId) ? null : payload.SessionLeaseId;
+        var request = new ResultPersistenceRequest(payload.CommandId, artifacts, leaseId, sessionState);
+        await _resultPersistenceQueue.QueueAsync(request).ConfigureAwait(false);
     }
 }
 

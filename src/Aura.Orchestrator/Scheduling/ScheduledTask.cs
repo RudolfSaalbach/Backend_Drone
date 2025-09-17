@@ -17,6 +17,7 @@ public sealed class ScheduledTask
     public DateTime EnqueuedAt { get; set; } = DateTime.UtcNow;
     public string NodeId { get; set; } = string.Empty;
     public string ProcessId { get; set; } = string.Empty;
+    public int PersonaRetryCount { get; set; }
 }
 
 public enum TaskPriority

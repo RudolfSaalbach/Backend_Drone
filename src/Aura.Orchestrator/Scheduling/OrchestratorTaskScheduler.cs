@@ -33,6 +33,7 @@ public sealed class OrchestratorTaskScheduler : BackgroundService
     private readonly ConcurrentDictionary<string, Channel<ScheduledTask>> _perDroneQueues = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _pacingTokens = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, int> _perDroneQueueLengths = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, DateTime> _lastAssignment = new(StringComparer.OrdinalIgnoreCase);
     private int _globalQueueLength;
 
     public OrchestratorTaskScheduler(
@@ -56,7 +57,7 @@ public sealed class OrchestratorTaskScheduler : BackgroundService
 
         var options = new BoundedChannelOptions(_config.Scheduling.ReadyQueue.Capacity)
         {
-            FullMode = BoundedChannelFullMode.DropOldest,
+            FullMode = BoundedChannelFullMode.Wait,
             SingleReader = false,
             SingleWriter = false
         };
@@ -73,8 +74,8 @@ public sealed class OrchestratorTaskScheduler : BackgroundService
         }
 
         await _globalReadyQueue.Writer.WriteAsync(task, cancellationToken).ConfigureAwait(false);
-        Interlocked.Increment(ref _globalQueueLength);
-        _metrics.RecordGauge("queue_global_length", Volatile.Read(ref _globalQueueLength));
+        var length = Interlocked.Increment(ref _globalQueueLength);
+        _metrics.RecordGauge("queue_global_length", length);
         _metrics.IncrementCounter("tasks_enqueued_total");
         return true;
     }
@@ -167,6 +168,11 @@ public sealed class OrchestratorTaskScheduler : BackgroundService
         var eligible = new List<DroneInfo>();
         foreach (var drone in active)
         {
+            if (_lastAssignment.TryGetValue(drone.DroneId, out var lastAssigned))
+            {
+                drone.LastTaskAssignedAt = lastAssigned;
+            }
+
             if (MatchesCapabilities(drone, task.RequiredCapabilities))
             {
                 eligible.Add(drone);
@@ -227,7 +233,7 @@ public sealed class OrchestratorTaskScheduler : BackgroundService
     {
         var options = new BoundedChannelOptions(_config.Scheduling.PerDroneQueue.Capacity)
         {
-            FullMode = BoundedChannelFullMode.DropOldest,
+            FullMode = BoundedChannelFullMode.Wait,
             SingleReader = true,
             SingleWriter = false
         };
@@ -287,10 +293,12 @@ public sealed class OrchestratorTaskScheduler : BackgroundService
                 CurrentCommand = task.CommandId
             }, cancellationToken).ConfigureAwait(false);
 
+            _lastAssignment[droneId] = DateTime.UtcNow;
+
             _commandLifecycle.RegisterDispatch(task.CommandId, droneId, pacingToken, domainLease);
             domainLease = null;
             _metrics.IncrementCounter("tasks_dispatched_total", 1, new Dictionary<string, string> { ["drone_id"] = droneId });
-            _ = MonitorAckTimeoutAsync(task.CommandId, droneId, cancellationToken);
+            _ = MonitorAckTimeoutAsync(task, droneId, cancellationToken);
         }
         catch (Exception ex)
         {
@@ -301,15 +309,67 @@ public sealed class OrchestratorTaskScheduler : BackgroundService
         }
     }
 
-    private async Task MonitorAckTimeoutAsync(string commandId, string droneId, CancellationToken cancellationToken)
+    private async Task MonitorAckTimeoutAsync(ScheduledTask task, string droneId, CancellationToken cancellationToken)
     {
-        var timeout = TimeSpan.FromSeconds(_config.Scheduling.AckTimeoutSec);
-        var acknowledged = await _commandLifecycle.WaitForAcknowledgementAsync(commandId, timeout, cancellationToken).ConfigureAwait(false);
-        if (!acknowledged)
+        try
         {
-            _logger.LogWarning("Ack timeout for command {CommandId} on drone {DroneId}", commandId, droneId);
-            _commandLifecycle.Fail(commandId, droneId, "ack_timeout");
+            var timeout = TimeSpan.FromSeconds(_config.Scheduling.AckTimeoutSec);
+            var ackResult = await _commandLifecycle.WaitForAcknowledgementAsync(task.CommandId, timeout, cancellationToken).ConfigureAwait(false);
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            if (ackResult.Status == CommandAcknowledgementStatus.Acknowledged)
+            {
+                return;
+            }
+
+            if (ackResult.Status == CommandAcknowledgementStatus.Failed)
+            {
+                _logger.LogDebug(
+                    "Command {CommandId} concluded with failure reason {Reason} before acknowledgement",
+                    task.CommandId,
+                    ackResult.FailureReason ?? "unknown");
+
+                if (string.Equals(ackResult.FailureReason, "drone_disconnected", StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.LogWarning(
+                        "Requeueing command {CommandId} after drone {DroneId} disconnected before acknowledgement",
+                        task.CommandId,
+                        droneId);
+                    task.EnqueuedAt = DateTime.UtcNow;
+                    await EnqueueTaskAsync(task, cancellationToken).ConfigureAwait(false);
+                    _metrics.IncrementCounter("tasks_requeued_total");
+                }
+
+                return;
+            }
+
+            _logger.LogWarning("Ack timeout for command {CommandId} on drone {DroneId}", task.CommandId, droneId);
+            _metrics.IncrementCounter("commands_ack_timeout_total", 1, new Dictionary<string, string> { ["drone_id"] = droneId });
+            _commandLifecycle.Fail(task.CommandId, droneId, "ack_timeout");
             await _droneRegistry.IncrementDroneErrorCountAsync(droneId, cancellationToken).ConfigureAwait(false);
+            await _droneRegistry.UpdateDroneStatusAsync(droneId, new StatusPayload
+            {
+                Status = "idle",
+                CurrentCommand = string.Empty
+            }, cancellationToken).ConfigureAwait(false);
+
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                task.EnqueuedAt = DateTime.UtcNow;
+                await EnqueueTaskAsync(task, cancellationToken).ConfigureAwait(false);
+                _metrics.IncrementCounter("tasks_requeued_total");
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Scheduler is shutting down; no requeue required.
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to handle ack timeout for command {CommandId}", task.CommandId);
         }
     }
 
@@ -321,6 +381,7 @@ public sealed class OrchestratorTaskScheduler : BackgroundService
             _perDroneQueues.TryRemove(droneId, out _);
             _pacingTokens.TryRemove(droneId, out _);
             _perDroneQueueLengths.TryRemove(droneId, out _);
+            _lastAssignment.TryRemove(droneId, out _);
             return false;
         }
 

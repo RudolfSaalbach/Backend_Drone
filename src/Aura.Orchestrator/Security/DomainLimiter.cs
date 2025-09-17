@@ -131,8 +131,8 @@ public sealed class DomainLimiter : IDomainLimiter
     private sealed class DroneDomainState
     {
         private readonly Queue<DateTime> _requestTimes = new();
+        private readonly Queue<DateTime> _burstRequestTimes = new();
         private DateTime _cooldownUntil = DateTime.MinValue;
-        private int _burstCounter;
 
         public object SyncRoot { get; } = new();
         public int CurrentConcurrency { get; set; }
@@ -156,12 +156,24 @@ public sealed class DomainLimiter : IDomainLimiter
         public void RecordRequest(DateTime timestamp, PerDomainLimits limits)
         {
             _requestTimes.Enqueue(timestamp);
-            _burstCounter++;
 
-            if (limits.BurstLimit > 0 && _burstCounter >= limits.BurstLimit)
+            if (limits.BurstLimit > 0)
             {
-                _cooldownUntil = timestamp.AddSeconds(Math.Max(1, limits.CooldownSeconds));
-                _burstCounter = 0;
+                var windowSeconds = Math.Max(1, limits.CooldownSeconds);
+                var window = TimeSpan.FromSeconds(windowSeconds);
+
+                while (_burstRequestTimes.Count > 0 && timestamp - _burstRequestTimes.Peek() > window)
+                {
+                    _burstRequestTimes.Dequeue();
+                }
+
+                _burstRequestTimes.Enqueue(timestamp);
+
+                if (_burstRequestTimes.Count >= limits.BurstLimit)
+                {
+                    _cooldownUntil = timestamp.AddSeconds(windowSeconds);
+                    _burstRequestTimes.Clear();
+                }
             }
         }
     }

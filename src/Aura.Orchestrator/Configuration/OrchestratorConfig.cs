@@ -1,0 +1,94 @@
+namespace Aura.Orchestrator.Configuration;
+
+/// <summary>
+/// Strongly typed configuration model for the orchestrator components.
+/// </summary>
+public sealed class OrchestratorConfig
+{
+    public SchedulingConfig Scheduling { get; set; } = new();
+    public LimitsConfig Limits { get; set; } = new();
+    public ServerConfig Server { get; set; } = new();
+}
+
+public sealed class SchedulingConfig
+{
+    public ReadyQueueConfig ReadyQueue { get; set; } = new();
+    public PerDroneQueueConfig PerDroneQueue { get; set; } = new();
+
+    /// <summary>
+    /// Maximum allowed in-flight commands per drone.
+    /// </summary>
+    public int MaxInFlightPerDrone { get; set; } = 1;
+
+    /// <summary>
+    /// Seconds the scheduler waits for an acknowledgement before timing out.
+    /// </summary>
+    public int AckTimeoutSec { get; set; } = 20;
+
+    /// <summary>
+    /// Seconds after which a missing heartbeat triggers a warning.
+    /// </summary>
+    public int HeartbeatExpectSec { get; set; } = 30;
+
+    /// <summary>
+    /// Grace period in seconds before a disconnected drone is deregistered.
+    /// </summary>
+    public int DisconnectGraceSec { get; set; } = 60;
+
+    /// <summary>
+    /// Sleep interval between per drone queue scans.
+    /// </summary>
+    public int DispatchLoopDelayMs { get; set; } = 100;
+}
+
+public sealed class ReadyQueueConfig
+{
+    public int Capacity { get; set; } = 1000;
+}
+
+public sealed class PerDroneQueueConfig
+{
+    public int Capacity { get; set; } = 10;
+}
+
+public sealed class LimitsConfig
+{
+    public GlobalDomainLimits Global { get; set; } = new();
+    public PerDomainLimits PerDomain { get; set; } = new();
+}
+
+public sealed class GlobalDomainLimits
+{
+    /// <summary>
+    /// Maximum concurrent sessions per domain across all drones.
+    /// </summary>
+    public int MaxConcurrentSessions { get; set; } = 25;
+}
+
+public sealed class PerDomainLimits
+{
+    /// <summary>
+    /// Maximum parallel sessions a single drone may run for a domain.
+    /// </summary>
+    public int ConcurrencyPerDrone { get; set; } = 1;
+
+    /// <summary>
+    /// Allowed requests per second for a single drone on a domain.
+    /// </summary>
+    public double QpsPerDrone { get; set; } = 2.0;
+
+    /// <summary>
+    /// Number of consecutive requests that trigger a cooldown.
+    /// </summary>
+    public int BurstLimit { get; set; } = 3;
+
+    /// <summary>
+    /// Cooldown duration in seconds once the burst limit has been exceeded.
+    /// </summary>
+    public int CooldownSeconds { get; set; } = 30;
+}
+
+public sealed class ServerConfig
+{
+    public string ApiKey { get; set; } = string.Empty;
+}

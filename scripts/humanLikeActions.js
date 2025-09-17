@@ -52,7 +52,7 @@ export async function humanLikeType(selector, text, profile = {}) {
     element.dispatchEvent(new Event('input', { bubbles: true }));
   }
 
-  let elapsed = 0;
+  let totalDelay = 0;
   let typedCount = 0;
   for (const char of text) {
     if ('value' in element) {
@@ -65,16 +65,16 @@ export async function humanLikeType(selector, text, profile = {}) {
     element.dispatchEvent(new Event('input', { bubbles: true }));
     element.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true }));
 
-    const delay = randomDelay(options.charDelayMs, options.varianceMs);
-    elapsed += delay;
+    const rawDelay = randomDelay(options.charDelayMs, options.varianceMs);
+    const delay = Math.max(0, Math.min(rawDelay, options.maxDelayMs));
+    totalDelay += delay;
     typedCount += 1;
-    if (elapsed > options.maxDelayMs) {
-      break;
+    if (delay > 0) {
+      await wait(delay);
     }
-    await wait(delay);
   }
 
-  return { typed: typedCount, totalDelayMs: elapsed };
+  return { typed: typedCount, totalDelayMs: totalDelay };
 }
 
 export async function humanLikeClick(selector, profile = {}) {
@@ -124,11 +124,17 @@ export async function humanLikeMouseMove(profile = {}) {
     return { moved: false };
   }
 
-  for (let i = 0; i < options.steps; i += 1) {
+  const rawSteps = Number(options.steps);
+  const steps = Number.isFinite(rawSteps) ? Math.max(1, Math.floor(rawSteps)) : Math.max(1, defaultMouseProfile.steps);
+  const waitPerStep = steps > 0 ? options.hoverMs / steps : options.hoverMs;
+
+  for (let i = 0; i < steps; i += 1) {
     const x = Math.random() * window.innerWidth;
     const y = Math.random() * window.innerHeight;
     document.dispatchEvent(new MouseEvent('mousemove', { clientX: x, clientY: y, bubbles: true }));
-    await wait(options.hoverMs / options.steps);
+    if (waitPerStep > 0) {
+      await wait(waitPerStep);
+    }
   }
 
   return { moved: true };

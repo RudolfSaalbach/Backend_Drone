@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Aura.Orchestrator.Models;
@@ -122,4 +123,22 @@ public sealed class ArtifactData
 
     [JsonProperty("metadata")]
     public JObject Metadata { get; set; } = new();
+}
+
+public sealed class DroneRegistrationPayload
+{
+    [JsonProperty("droneId")]
+    public string DroneId { get; set; } = string.Empty;
+
+    [JsonProperty("version")]
+    public string Version { get; set; } = string.Empty;
+
+    [JsonProperty("staticCapabilities")]
+    public IList<string>? StaticCapabilities { get; set; }
+
+    [JsonProperty("modules")]
+    public IList<string>? Modules { get; set; }
+
+    [JsonProperty("limitsSupported")]
+    public LimitsSupport? LimitsSupported { get; set; }
 }

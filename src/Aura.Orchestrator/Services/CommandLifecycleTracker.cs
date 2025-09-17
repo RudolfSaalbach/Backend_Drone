@@ -12,6 +12,7 @@ public sealed class CommandLifecycleTracker : ICommandLifecycleTracker
 {
     private readonly ILogger<CommandLifecycleTracker> _logger;
     private readonly ConcurrentDictionary<string, CommandState> _states = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, CommandAcknowledgementResult> _completionResults = new(StringComparer.OrdinalIgnoreCase);
 
     public CommandLifecycleTracker(ILogger<CommandLifecycleTracker> logger)
     {
@@ -21,6 +22,7 @@ public sealed class CommandLifecycleTracker : ICommandLifecycleTracker
     public CommandDispatchRegistration RegisterDispatch(string commandId, string droneId, SemaphoreSlim pacingToken, DomainLease? domainLease)
     {
         var state = new CommandState(droneId, pacingToken, domainLease);
+        _completionResults.TryRemove(commandId, out _);
         if (!_states.TryAdd(commandId, state))
         {
             throw new InvalidOperationException($"Command {commandId} is already tracked.");
@@ -29,11 +31,16 @@ public sealed class CommandLifecycleTracker : ICommandLifecycleTracker
         return new CommandDispatchRegistration(commandId, droneId);
     }
 
-    public async Task<bool> WaitForAcknowledgementAsync(string commandId, TimeSpan timeout, CancellationToken cancellationToken)
+    public async Task<CommandAcknowledgementResult> WaitForAcknowledgementAsync(string commandId, TimeSpan timeout, CancellationToken cancellationToken)
     {
         if (!_states.TryGetValue(commandId, out var state))
         {
-            return false;
+            if (_completionResults.TryRemove(commandId, out var completed))
+            {
+                return completed;
+            }
+
+            return CommandAcknowledgementResult.Acknowledged;
         }
 
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -46,7 +53,7 @@ public sealed class CommandLifecycleTracker : ICommandLifecycleTracker
             return await ackTask.ConfigureAwait(false);
         }
 
-        return false;
+        return CommandAcknowledgementResult.Timeout;
     }
 
     public void MarkAcknowledged(string commandId, string droneId)
@@ -71,6 +78,7 @@ public sealed class CommandLifecycleTracker : ICommandLifecycleTracker
         {
             state.MarkAcknowledged();
             state.ReleaseResources();
+            _completionResults[commandId] = CommandAcknowledgementResult.Acknowledged;
         }
         else
         {
@@ -84,6 +92,7 @@ public sealed class CommandLifecycleTracker : ICommandLifecycleTracker
         {
             state.MarkFailed(reason);
             state.ReleaseResources();
+            _completionResults[commandId] = new CommandAcknowledgementResult(CommandAcknowledgementStatus.Failed, reason);
         }
         else
         {
@@ -99,13 +108,14 @@ public sealed class CommandLifecycleTracker : ICommandLifecycleTracker
             {
                 state.MarkFailed(reason);
                 state.ReleaseResources();
+                _completionResults[entry.Key] = new CommandAcknowledgementResult(CommandAcknowledgementStatus.Failed, reason);
             }
         }
     }
 
     private sealed class CommandState
     {
-        private readonly TaskCompletionSource<bool> _acknowledged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<CommandAcknowledgementResult> _acknowledged = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public CommandState(string droneId, SemaphoreSlim pacingToken, DomainLease? domainLease)
         {
@@ -117,18 +127,18 @@ public sealed class CommandLifecycleTracker : ICommandLifecycleTracker
         public string DroneId { get; }
         public SemaphoreSlim PacingToken { get; }
         public DomainLease? DomainLease { get; }
-        public Task<bool> AcknowledgedTask => _acknowledged.Task;
+        public Task<CommandAcknowledgementResult> AcknowledgedTask => _acknowledged.Task;
 
         public bool BelongsTo(string droneId) => string.Equals(DroneId, droneId, StringComparison.OrdinalIgnoreCase);
 
         public void MarkAcknowledged()
         {
-            _acknowledged.TrySetResult(true);
+            _acknowledged.TrySetResult(CommandAcknowledgementResult.Acknowledged);
         }
 
         public void MarkFailed(string reason)
         {
-            _acknowledged.TrySetResult(false);
+            _acknowledged.TrySetResult(new CommandAcknowledgementResult(CommandAcknowledgementStatus.Failed, reason));
         }
 
         public void ReleaseResources()
